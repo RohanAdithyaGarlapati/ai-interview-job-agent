@@ -1,0 +1,11 @@
+# Never bake secrets into the image - Render injects them as env vars instead.
+.env
+*.env
+!.env.example
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+test_results.json

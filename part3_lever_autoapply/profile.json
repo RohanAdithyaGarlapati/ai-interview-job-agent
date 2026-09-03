@@ -1,0 +1,21 @@
+{
+  "full_name": "Alex Demo Candidate",
+  "email": "alex.demo.candidate@example.com",
+  "phone": "+1 555 010 2020",
+  "current_location": "New York, NY, USA",
+  "current_company": "Example Analytics Inc.",
+  "resume_path": "sample_resume.pdf",
+  "notice_period": "1 month",
+  "start_month": "January",
+  "expected_salary_range": "$85,000 - $95,000",
+  "how_heard": "Job board",
+  "visa_status_label": "No, I am an American Citizen or Permanent Resident.",
+  "visa_details": "N/A",
+  "open_to_nyc_office": "Yes",
+  "preferred_coding_language": "Python",
+  "dei_gender": "Prefer not to say",
+  "dei_ethnicity": "Prefer not to say",
+  "dei_age_bracket": "Prefer not to say",
+  "dei_how_heard": "LinkedIn",
+  "consent_data_retention": true
+}

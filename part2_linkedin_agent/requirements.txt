@@ -1,0 +1,7 @@
+requests
+beautifulsoup4
+lxml
+playwright
+fastapi
+uvicorn[standard]
+python-multipart

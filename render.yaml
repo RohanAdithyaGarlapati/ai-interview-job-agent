@@ -1,0 +1,51 @@
+# Render blueprint for both take-home services.
+#
+# Both are declared as web services rather than one web service plus a
+# background worker, because background workers are not part of Render's free
+# tier. Part 1 therefore supervises its LiveKit agent worker as a child process
+# inside its web service (see part1_mock_interview/server.py).
+#
+# Deploy: push this repo to GitHub, then in Render choose
+# New > Blueprint and point it at the repo. Set the secrets marked sync:false
+# in the dashboard - they are deliberately not committed here.
+
+services:
+  # ----------------------------------------------------------------------- #
+  # Part 1 - AI mock interview (join page + supervised LiveKit agent worker)
+  # ----------------------------------------------------------------------- #
+  - type: web
+    name: mock-interview
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./part1_mock_interview/Dockerfile
+    dockerContext: ./part1_mock_interview
+    healthCheckPath: /healthz
+    envVars:
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      # Optional: the interview runs voice-only when these are absent or the
+      # Tavus account is out of conversational credits.
+      - key: TAVUS_API_KEY
+        sync: false
+      - key: TAVUS_REPLICA_ID
+        sync: false
+
+  # ----------------------------------------------------------------------- #
+  # Part 2 - LinkedIn job-source resolver
+  # ----------------------------------------------------------------------- #
+  - type: web
+    name: linkedin-job-source
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./part2_linkedin_agent/Dockerfile
+    dockerContext: ./part2_linkedin_agent
+    healthCheckPath: /
+    # Needs no credentials at all: LinkedIn is read as an unauthenticated guest
+    # page and Clearbit's autocomplete endpoint is keyless.
+    envVars: []

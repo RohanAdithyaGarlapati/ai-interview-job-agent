@@ -1,0 +1,88 @@
+"""Minimal demo UI: paste a LinkedIn job URL, see the resolved company job-listing page.
+
+Run locally:
+    python webapp.py
+    -> open http://localhost:8000
+
+To make this reachable by someone outside your machine (e.g. for the take-home
+reviewer to test their own 10 URLs), deploy this FastAPI app to any host you
+control (Render/Railway/Fly.io/a VM) -- see README.md for a ready-to-use
+Dockerfile/Procfile. Creating a hosting account isn't something this assistant
+does on your behalf, so that last step is on you.
+"""
+import os
+
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse
+
+from agent.pipeline import resolve_job_source
+
+app = FastAPI()
+
+PAGE = """
+<!doctype html>
+<html>
+<head>
+<title>LinkedIn Job Source Agent</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }}
+  input[type=text] {{ width: 100%; padding: 10px; font-size: 15px; box-sizing: border-box; }}
+  button {{ padding: 10px 20px; font-size: 15px; margin-top: 10px; cursor: pointer; }}
+  .result {{ margin-top: 24px; padding: 16px; border-radius: 8px; }}
+  .ok {{ background: #e6f6ec; border: 1px solid #34a853; }}
+  .fail {{ background: #fdecea; border: 1px solid #d93025; }}
+  .row {{ margin: 6px 0; }}
+  .label {{ color: #555; font-size: 13px; }}
+  a {{ word-break: break-all; }}
+</style>
+</head>
+<body>
+  <h2>LinkedIn Job Source Agent</h2>
+  <p>Paste a LinkedIn job posting URL. The agent resolves the company, then finds
+  the actual job-listing page on the company's own site (Greenhouse, Lever,
+  Ashby, Workday, or their in-house careers page).</p>
+  <form method="post">
+    <input type="text" name="url" placeholder="https://www.linkedin.com/jobs/view/..." value="{url}">
+    <button type="submit">Resolve</button>
+  </form>
+  {result_html}
+</body>
+</html>
+"""
+
+
+def render_result(r: dict) -> str:
+    if r["success"]:
+        return f"""
+        <div class="result ok">
+          <div class="row"><b>Company:</b> {r.get('company_name')}</div>
+          <div class="row"><b>Job title:</b> {r.get('job_title') or '(unknown)'}</div>
+          <div class="row"><b>Job listing page:</b> <a href="{r['final_url']}" target="_blank">{r['final_url']}</a></div>
+          <div class="row label">ATS detected: {r.get('ats_detected') or 'none (in-house careers page)'}</div>
+          <div class="row label">Method: {r.get('method')}</div>
+        </div>
+        """
+    return f"""
+    <div class="result fail">
+      <div class="row"><b>Could not resolve this posting.</b></div>
+      <div class="row">{r.get('error')}</div>
+    </div>
+    """
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return PAGE.format(url="", result_html="")
+
+
+@app.post("/", response_class=HTMLResponse)
+def submit(url: str = Form(...)):
+    result = resolve_job_source(url).to_dict()
+    return PAGE.format(url=url, result_html=render_result(result))
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # Render (and most PaaS) inject the port to bind on via $PORT.
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

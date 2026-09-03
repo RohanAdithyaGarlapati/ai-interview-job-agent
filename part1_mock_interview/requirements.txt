@@ -1,0 +1,6 @@
+livekit-agents[openai,silero,turn-detector]~=1.7
+livekit-plugins-tavus~=1.7
+livekit-api
+python-dotenv
+fastapi
+uvicorn[standard]
