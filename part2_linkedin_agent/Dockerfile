@@ -1,13 +1,18 @@
-# Playwright's own image already carries Chromium plus every system library it
-# needs. Installing the browser onto a bare python-slim image instead means
-# chasing a long list of shared-object dependencies, and the resulting image is
-# no smaller once Chromium is in it.
-FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+# Plain slim base, with Chromium installed by Playwright itself at build time.
+#
+# The obvious alternative - Microsoft's mcr.microsoft.com/playwright/python
+# image - couples two versions that then drift: the image tag pins the browser
+# binaries, while an unpinned `playwright` in requirements.txt installs whatever
+# is newest on top of them. Letting `playwright install` fetch the browsers means
+# the library and the binaries always match, whatever version resolves.
+FROM python:3.12-slim
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+ && playwright install --with-deps chromium \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 

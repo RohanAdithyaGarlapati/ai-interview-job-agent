@@ -10,6 +10,7 @@ control (Render/Railway/Fly.io/a VM) -- see README.md for a ready-to-use
 Dockerfile/Procfile. Creating a hosting account isn't something this assistant
 does on your behalf, so that last step is on you.
 """
+import asyncio
 import os
 
 from fastapi import FastAPI, Form
@@ -76,8 +77,15 @@ def index():
 
 
 @app.post("/", response_class=HTMLResponse)
-def submit(url: str = Form(...)):
-    result = resolve_job_source(url).to_dict()
+async def submit(url: str = Form(...)):
+    # Hand the pipeline to a worker thread explicitly. It drives Playwright's
+    # *sync* API, which refuses to run on a thread that has a live asyncio event
+    # loop ("Please use the Async API instead") - and when it refuses, the
+    # pipeline swallows the error and quietly returns the careers page instead of
+    # the ATS listing, so the failure looks like a weak result rather than a bug.
+    # FastAPI does route plain `def` handlers to a threadpool, but that was not
+    # holding once deployed, so this does not rely on it.
+    result = await asyncio.to_thread(lambda: resolve_job_source(url).to_dict())
     return PAGE.format(url=url, result_html=render_result(result))
 
 
