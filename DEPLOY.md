@@ -50,8 +50,17 @@ Tavus outage or an exhausted credit balance cannot take the interview down.
 
 ## 4. Check it came up
 
+Render appends a random suffix when the service name is already taken globally,
+so read the real URL off the service page rather than assuming it matches the
+name. These are the live ones:
+
+| Service | URL |
+|---|---|
+| Part 1 - mock interview | <https://mock-interview-2ob2.onrender.com> |
+| Part 2 - job source | <https://linkedin-job-source.onrender.com> |
+
 ```bash
-curl https://mock-interview.onrender.com/healthz
+curl https://mock-interview-2ob2.onrender.com/healthz
 ```
 
 `{"ok": true, "agent_worker_running": true}` means the web service is up *and*
