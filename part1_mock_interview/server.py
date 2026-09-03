@@ -73,11 +73,17 @@ async def _startup() -> None:
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
+    """Liveness for the web tier, plus the worker's true state in the body.
+
+    Deliberately 200 even when the worker is down. The platform health check
+    reacts to non-2xx by restarting the container, which would fight the
+    supervisor above - it is already restarting the worker with backoff, and
+    killing the container mid-backoff just loses that state and drops any
+    interview in progress. Read `agent_worker_running` to know whether a
+    candidate would actually meet an interviewer.
+    """
     running = _worker_proc is not None and _worker_proc.returncode is None
-    return JSONResponse(
-        {"ok": True, "agent_worker_running": running},
-        status_code=200 if running else 503,
-    )
+    return JSONResponse({"ok": True, "agent_worker_running": running})
 
 
 @app.post("/api/token")
