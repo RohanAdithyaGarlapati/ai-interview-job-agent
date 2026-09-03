@@ -81,8 +81,70 @@ def _name_variations(company_name: str) -> list[str]:
     return variations
 
 
+# Country-code TLDs that contradict a US-based job posting. Deliberately a small
+# denylist of "this is definitely somewhere else" rather than an attempt to map
+# every ccTLD to a country: the only judgement being made is "an exact name match
+# on a foreign ccTLD is weaker evidence than a near match on a neutral domain",
+# and a short list is enough for that.
+_FOREIGN_CCTLDS = (
+    ".co.za", ".co.uk", ".co.in", ".com.au", ".com.br", ".co.nz", ".co.jp",
+    ".com.tr", ".tr", ".de", ".fr", ".nl", ".es", ".it", ".pl", ".se", ".no", ".dk", ".fi",
+    ".in", ".cn", ".jp", ".ru", ".za", ".ie", ".ch", ".at", ".be",
+)
+
+_US_HINTS = ("united states", "usa", "u.s.", "us", "america")
+
+
+def _looks_us(location: str | None) -> bool:
+    if not location:
+        return False
+    loc = location.strip().lower()
+    return loc in _US_HINTS or any(h in loc for h in ("united states", "usa", ", us"))
+
+
+def _better_than(chosen: dict, candidates: list[dict], target_norm: str, location: str | None):
+    """Replace `chosen` only when it is itself plainly in the wrong country.
+
+    Company names are not unique across countries, and an exact name match is
+    not automatically the right company. Real case: a posting for "MANTECH",
+    Machine Learning Engineer, United States. Clearbit returns both
+    "MANTECH" -> mantech.co.za (a South African firm, an exact string match) and
+    "ManTech International" -> mantech.com (the US contractor actually hiring).
+    Name alone confidently picks the wrong one.
+
+    The check is deliberately on `chosen` alone, not on the candidate list. An
+    earlier version scanned the whole list for *any* foreign exact match and then
+    substituted an alternative - which regressed "Bevel", where Clearbit returns
+    five exact matches: it saw bevel.co.jp further down the list and swapped the
+    already-correct getbevel.com out for bevel.com.tr. If the candidate being
+    returned is fine, nothing here should touch it.
+    """
+    dom = (chosen.get("domain") or "").lower()
+    if not dom.endswith(_FOREIGN_CCTLDS) or not _looks_us(location):
+        return None
+
+    for alt in candidates:
+        alt_dom = (alt.get("domain") or "").lower()
+        alt_norm = _normalize(alt.get("name", ""))
+        # The alternative must be on a neutral domain whose own root *is* the
+        # company name - so "ManTech International" at mantech.com qualifies,
+        # while an unrelated firm that merely starts with the same letters does
+        # not. Prefix matching is safe only under that second condition; used
+        # alone it is the trap that once matched "Aven" to "Aventon".
+        if (
+            not alt_dom.endswith(_FOREIGN_CCTLDS)
+            and alt_norm.startswith(target_norm)
+            and alt_dom.split(".")[0] == target_norm
+        ):
+            return alt
+    return None
+
+
 def resolve_company_domain(
-    company_name: str, company_slug: str | None = None, timeout: int = 10
+    company_name: str,
+    company_slug: str | None = None,
+    timeout: int = 10,
+    location: str | None = None,
 ) -> DomainResult:
     queries: list[str] = []
 
@@ -106,9 +168,13 @@ def resolve_company_domain(
         if not candidates:
             continue
 
-        # Only accept an exact normalized-name match.
+        # Only accept an exact normalized-name match...
         for c in candidates:
             if _normalize(c.get("name", "")) == target_norm:
+                # ...unless that match is itself in a country the job is not in.
+                better = _better_than(c, candidates, target_norm, location)
+                if better:
+                    return DomainResult(better["domain"], better["name"], query, candidates)
                 return DomainResult(c["domain"], c["name"], query, candidates)
 
     return DomainResult(None, None, None, all_candidates)

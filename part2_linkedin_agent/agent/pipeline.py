@@ -51,7 +51,9 @@ def resolve_job_source(linkedin_url: str) -> JobSourceResult:
     result.company_name = job.company_name
     result.job_title = job.job_title
 
-    domain_result = resolve_company_domain(job.company_name, job.company_slug)
+    domain_result = resolve_company_domain(
+        job.company_name, job.company_slug, location=job.location
+    )
     domain = domain_result.domain
 
     if not domain:
