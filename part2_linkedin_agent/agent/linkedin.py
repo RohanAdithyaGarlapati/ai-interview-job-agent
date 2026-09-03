@@ -7,6 +7,7 @@ never on the authenticated API, so this keeps working without a LinkedIn account
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 
 import requests
@@ -57,10 +58,36 @@ class LinkedInFetchError(RuntimeError):
     pass
 
 
-def fetch_linkedin_job(job_url: str, timeout: int = 15) -> LinkedInJob:
-    resp = requests.get(job_url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-    if resp.status_code != 200:
-        raise LinkedInFetchError(f"LinkedIn returned HTTP {resp.status_code} for {job_url}")
+RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+
+
+def fetch_linkedin_job(job_url: str, timeout: int = 15, attempts: int = 4) -> LinkedInJob:
+    """Fetch a LinkedIn guest job page, retrying through rate limits.
+
+    LinkedIn throttles shared datacenter IPs far harder than residential ones,
+    so a deployed copy sees intermittent 429s that never appear when running
+    from a laptop. The throttling is per-burst rather than a standing block -
+    waiting a moment and retrying gets through - so 429 and 5xx are retried
+    while everything else fails immediately, no amount of waiting fixing a 404.
+    """
+    resp = None
+    for attempt in range(attempts):
+        resp = requests.get(job_url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+        if resp.status_code == 200 or resp.status_code not in RETRYABLE_STATUS:
+            break
+        if attempt < attempts - 1:
+            retry_after = (resp.headers.get("Retry-After") or "").strip()
+            delay = float(retry_after) if retry_after.isdigit() else 1.5 * (2**attempt)
+            time.sleep(min(delay, 12.0))
+
+    if resp is None or resp.status_code != 200:
+        code = resp.status_code if resp is not None else "no response"
+        hint = (
+            " - LinkedIn is rate-limiting this server's IP; trying again shortly usually works"
+            if code == 429
+            else ""
+        )
+        raise LinkedInFetchError(f"LinkedIn returned HTTP {code} for {job_url}{hint}")
 
     # LinkedIn's guest pages are UTF-8 but do not always say so in the header,
     # and requests then falls back to latin-1 - which mangles the middle dot the
