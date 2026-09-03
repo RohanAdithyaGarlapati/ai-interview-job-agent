@@ -12,6 +12,7 @@ does on your behalf, so that last step is on you.
 """
 import asyncio
 import os
+import re
 
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse
@@ -76,8 +77,47 @@ def index():
     return PAGE.format(url="", result_html="")
 
 
+LINKEDIN_JOB_RE = re.compile(
+    r"^https?://([a-z0-9-]+\.)*linkedin\.com/jobs/view/", re.I
+)
+
+
+def validate_job_url(raw: str) -> str | None:
+    """Return a complaint about `raw`, or None if it looks usable.
+
+    Checked up front so an unusable input says so plainly. Without this the
+    pipeline dutifully fetches whatever it was given and fails several steps
+    later with "could not find company name on guest job page", which reads as
+    the agent being broken rather than as the URL being wrong.
+    """
+    url = (raw or "").strip()
+    if not url:
+        return "Please paste a LinkedIn job URL."
+    if not url.lower().startswith(("http://", "https://")):
+        return "That does not look like a URL. It should start with https://"
+    if "linkedin.com" not in url.lower():
+        return (
+            "That is not a LinkedIn URL. This tool takes a LinkedIn job posting, "
+            "like https://www.linkedin.com/jobs/view/4413378187"
+        )
+    if not LINKEDIN_JOB_RE.match(url):
+        return (
+            "That is a LinkedIn URL but not a job posting. Job postings look like "
+            "linkedin.com/jobs/view/<id> - a company page or a search results page "
+            "will not work."
+        )
+    return None
+
+
 @app.post("/", response_class=HTMLResponse)
 async def submit(url: str = Form(...)):
+    complaint = validate_job_url(url)
+    if complaint:
+        return PAGE.format(
+            url=url,
+            result_html=render_result({"success": False, "error": complaint}),
+        )
+
     # Hand the pipeline to a worker thread explicitly. It drives Playwright's
     # *sync* API, which refuses to run on a thread that has a live asyncio event
     # loop ("Please use the Async API instead") - and when it refuses, the
