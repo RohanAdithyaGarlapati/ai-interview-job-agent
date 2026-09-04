@@ -1,31 +1,45 @@
 """LiveKit mock interview agent with a real-time Tavus avatar.
 
-The interviewer runs a full, open-ended interview rather than a scripted set of
-stages on a clock: it works through an agenda of topics, asks follow-ups grounded
-in what the candidate actually said, and moves on when a thread is exhausted.
-There are deliberately no wall-clock stage timers - an interview ends when the
-conversation is done, and cutting a candidate off mid-answer to satisfy a timer
-is exactly what makes a mock interview feel fake.
+Two stages, per the brief: self-introduction, then past experience.
 
-Speech is a stitched STT -> LLM -> TTS pipeline running on LiveKit Cloud
-Inference, so the only credentials required are the LiveKit ones. See
-TURN_HANDLING below for the responsiveness tuning. The Tavus avatar consumes the
-session audio and publishes a lip-synced video track when credits allow; if it
-is unavailable the interview continues voice-only.
+Transitions are driven two ways so the interview always progresses:
+
+  - Normally, the interviewer decides the stage is done and calls the
+    `advance_stage` tool. This is the "well-defined switching logic": one
+    explicit call, so a transition is a discrete event rather than something
+    inferred from the model drifting onto a new topic.
+
+  - If that never fires - a candidate who rambles, or a model that will not let
+    go of a thread - a wall-clock fallback steps in. It escalates rather than
+    cutting in: at the stage budget the interviewer is *told* to wrap up and
+    move on itself, so the handover still lands on a natural beat; only at
+    HARD_LIMIT_MULTIPLIER x the budget is the transition forced outright.
+
+Within a stage the interviewer is asked to keep digging - follow-ups grounded in
+what the candidate actually said - because a stage that is one question long is
+not an interview. The budgets are generous for that reason.
+
+Speech is a stitched STT -> LLM -> TTS pipeline on LiveKit Cloud Inference, so
+the only credentials required are the LiveKit ones. See TURN_HANDLING for the
+responsiveness tuning. The Tavus avatar publishes a lip-synced video track when
+credits allow; if it is unavailable the interview continues voice-only.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from livekit.agents import (
     Agent,
     AgentSession,
+    APIConnectOptions,
     JobContext,
     JobProcess,
+    RunContext,
     WorkerOptions,
     cli,
+    function_tool,
 )
-from livekit.agents import APIConnectOptions
 from livekit.agents.voice.turn import TurnHandlingOptions
 from livekit.plugins import silero, tavus
 
@@ -33,6 +47,8 @@ from config import (
     LIVEKIT_API_KEY,
     LIVEKIT_API_SECRET,
     LIVEKIT_URL,
+    PAST_EXPERIENCE_DURATION_SECONDS,
+    SELF_INTRO_DURATION_SECONDS,
     TAVUS_API_KEY,
     TAVUS_REPLICA_ID,
     validate_credentials,
@@ -41,67 +57,84 @@ from config import (
 logger = logging.getLogger("mock-interview")
 
 
-INTERVIEWER_INSTRUCTIONS = """\
+BASE_INSTRUCTIONS = """\
 You are a warm, sharp technical interviewer running a mock interview. This is a
-real conversation, not a questionnaire. Your goal is to understand this person
-properly, the way a good interviewer would.
+real conversation, not a questionnaire.
 
 HOW YOU TALK
-- Ask ONE question, then stop and listen to the entire answer.
-- The moment they finish, come straight back - no dead air. Start with a short
-  reaction ("oh nice", "got it", "mm, interesting") and let your actual question
-  follow right behind it. Never open with a long preamble.
-- Keep your turns short. This is speech. Two or three sentences is usually
-  plenty. Never read out bullet points, headings, or stage directions.
+- Ask ONE question, then stop and listen to the whole answer.
+- The moment they finish, come straight back - no dead air. Open with a short
+  reaction ("oh nice", "got it", "mm, interesting") and let the question follow
+  right behind it.
+- Keep turns short. This is speech. Two or three sentences is usually plenty.
+  Never read out bullet points, headings, or stage directions.
 - Never ask two questions in one turn.
 - If they interrupt you, stop talking immediately and listen.
-- If they give you a very short or thin answer ("yeah, a few projects"), do not
-  accept it and move on - that is the moment to ask for the specifics.
+- If an answer is thin ("yeah, a few projects"), do not accept it and move on -
+  that is exactly when to ask for specifics.
 
 HOW YOU QUESTION
-- Your next question should come out of what they just said, using their own
+- Your next question should come out of what they just said, in their own
   words: "you said the migration was painful - what actually broke?"
-- Dig. When an answer is vague, general, or interesting, follow up rather than
-  moving on. Three or four exchanges on one thread is good interviewing.
-- Prefer specifics over generalities. If they say "we improved performance", ask
-  by how much, measured how, and what the bottleneck turned out to be.
-- Ask about their own contribution, not just what the team did.
-- Be curious rather than interrogating. You are trying to understand, not catch
-  them out.
-
-THE AGENDA
-Work through these areas in roughly this order, spending several exchanges on
-each. This is a guide, not a script - follow genuinely interesting threads
-wherever they go, and skip anything that clearly does not apply.
-
-1.  Introduction - who they are, how they got here.
-2.  Their background - the roles and transitions they mentioned, and why.
-3.  A project they are proud of - what it was and why it mattered.
-4.  Their specific contribution to it, in detail.
-5.  The hardest technical problem in it, and how they worked it out.
-6.  Design and trade-off decisions - what they chose, what they rejected, why.
-7.  Something that went wrong, and what they learned.
-8.  How they work with other people - disagreements, reviews, mentoring.
-9.  What they are curious about or learning now.
-10. Invite their questions, then thank them warmly and close.
-
-Keep going through this. Do not wrap the interview up early - there is a lot to
-get through, and a short interview is a bad interview. Open by greeting them and
-asking them to tell you about themselves.
+- Dig. Three or four exchanges on one thread is good interviewing, not stalling.
+- Prefer specifics. If they say "we improved performance", ask by how much,
+  measured how, and what the bottleneck turned out to be.
+- Ask what *they* did, not only what the team did.
 """
+
+STAGE_INSTRUCTIONS = {
+    "self_introduction": (
+        "STAGE 1 of 2 - SELF-INTRODUCTION. Ask them to tell you about "
+        "themselves, then have a real conversation about it: pick up on the "
+        "specifics they mention - a company, a role, a technology, a change of "
+        "direction - and ask about those. Stay here for several exchanges. When "
+        "you genuinely understand their background and the thread has run its "
+        "course, call the advance_stage tool. Do not move to their projects "
+        "without calling it."
+    ),
+    "past_experience": (
+        "STAGE 2 of 2 - PAST EXPERIENCE. Ask about a challenging project they "
+        "have worked on, then dig in over several exchanges: their specific "
+        "contribution, what made it hard, the trade-offs they chose, what they "
+        "would do differently, what they took from it. Follow the threads their "
+        "answers open up. When the topic is genuinely exhausted, call the "
+        "advance_stage tool to wrap up."
+    ),
+    "complete": (
+        "The interview is over. Thank them warmly, tell them they will hear back "
+        "with feedback, and say goodbye. Do not ask further questions."
+    ),
+}
+
+STAGE_ORDER = ["self_introduction", "past_experience", "complete"]
+
+# Soft budgets: reaching one prompts the interviewer to wrap the stage up of its
+# own accord, so the candidate is never cut off mid-sentence.
+STAGE_BUDGET = {
+    "self_introduction": SELF_INTRO_DURATION_SECONDS,
+    "past_experience": PAST_EXPERIENCE_DURATION_SECONDS,
+}
+
+# How far past its budget a stage may run before the transition is forced.
+HARD_LIMIT_MULTIPLIER = 1.75
+
+# Floor on how long a stage must have been live before another transition is
+# honoured. Guards the timer-vs-tool race in _go_next; must stay well under the
+# smallest budget so genuine early transitions still land.
+MIN_SECONDS_IN_STAGE = 15.0
 
 
 # How fast the interviewer comes back once the candidate stops talking.
 #
-# endpointing.min_delay is the floor on silence before the turn is considered
-# over - the dead air paid on every single reply. 'dynamic' lets it stretch
-# toward max_delay when the candidate sounds mid-thought (trailing "and...",
-# "so..."), so a snappy floor does not mean getting cut off while thinking.
+# endpointing.min_delay is the dead air paid on every single reply. 'dynamic'
+# lets it stretch toward max_delay when the candidate sounds mid-thought
+# (trailing "and...", "so..."), so a snappy floor does not mean being cut off
+# while thinking.
 #
-# preemptive_generation is the real win: the reply starts being generated, and
-# spoken, from the partial transcript *before* the turn is formally committed,
-# so most of the model's thinking time is spent while the candidate is still
-# finishing. That time stops being latency the candidate can feel.
+# preemptive_generation is the larger win: the reply is generated, and spoken,
+# from the partial transcript *before* the turn is formally committed, so most
+# of the model's thinking happens while the candidate is still finishing and
+# stops being latency they can feel.
 TURN_HANDLING: TurnHandlingOptions = {
     "endpointing": {"mode": "dynamic", "min_delay": 0.25, "max_delay": 2.0},
     "preemptive_generation": {"enabled": True, "preemptive_tts": True},
@@ -110,15 +143,100 @@ TURN_HANDLING: TurnHandlingOptions = {
 
 class InterviewAgent(Agent):
     def __init__(self) -> None:
-        super().__init__(instructions=INTERVIEWER_INSTRUCTIONS)
+        super().__init__(
+            instructions=f"{BASE_INSTRUCTIONS}\n\n{STAGE_INSTRUCTIONS['self_introduction']}"
+        )
+        self.stage = "self_introduction"
+        self._timer: asyncio.Task | None = None
+        self._entered_stage_at = 0.0
 
     async def on_enter(self) -> None:
+        self._entered_stage_at = asyncio.get_running_loop().time()
+        self._arm_timer()
         self.session.generate_reply(
             instructions=(
                 "Greet the candidate warmly, introduce yourself as their interviewer "
                 "in one sentence, then ask them to tell you about themselves."
             )
         )
+
+    @function_tool
+    async def advance_stage(self, ctx: RunContext) -> str:
+        """Move the interview on to the next stage. Call this once the candidate
+        has finished with the current stage's topic."""
+        return await self._go_next(reason="interviewer judged the stage complete")
+
+    async def _go_next(self, reason: str) -> str:
+        idx = STAGE_ORDER.index(self.stage)
+        if idx >= len(STAGE_ORDER) - 1:
+            return "The interview is already complete."
+
+        # The fallback timer and the model's own advance_stage call can race: the
+        # timer fires, and a moment later the tool call the model had *already
+        # decided on* for the previous stage lands and advances again, skipping a
+        # stage outright. Ignore a transition arriving right behind another - it
+        # is that stale duplicate, not a real second handover.
+        since = asyncio.get_running_loop().time() - self._entered_stage_at
+        if since < MIN_SECONDS_IN_STAGE:
+            logger.info(
+                "ignoring '%s' %.1fs into %s (stale duplicate)", reason, since, self.stage
+            )
+            return f"Still on stage: {self.stage}. Continue with the current topic."
+
+        self.stage = STAGE_ORDER[idx + 1]
+        self._entered_stage_at = asyncio.get_running_loop().time()
+        logger.info("stage -> %s (%s)", self.stage, reason)
+
+        await self.update_instructions(
+            f"{BASE_INSTRUCTIONS}\n\n{STAGE_INSTRUCTIONS[self.stage]}"
+        )
+        self._arm_timer()
+        return f"Moved to stage: {self.stage}. Continue from the new instructions."
+
+    def _arm_timer(self) -> None:
+        """Time-based fallback, in two escalating steps.
+
+        A single hard cut at the budget makes the interview feel like a kitchen
+        timer, so: at the budget the interviewer is nudged to wrap up and
+        transition itself, and only at the hard limit is the change forced.
+        """
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+
+        budget = STAGE_BUDGET.get(self.stage)
+        if budget is None:
+            return
+
+        stage_when_armed = self.stage
+
+        async def _fire() -> None:
+            try:
+                await asyncio.sleep(budget)
+                if self.stage != stage_when_armed:
+                    return  # advanced naturally; nothing to nudge
+                logger.info("soft nudge: %ss elapsed on %s", budget, stage_when_armed)
+                await self.update_instructions(
+                    f"{BASE_INSTRUCTIONS}\n\n{STAGE_INSTRUCTIONS[stage_when_armed]}\n\n"
+                    "You have spent a while here. Ask at most one more question, "
+                    "then call advance_stage to move on."
+                )
+
+                await asyncio.sleep(budget * HARD_LIMIT_MULTIPLIER - budget)
+                if self.stage != stage_when_armed:
+                    return  # took the hint
+                logger.info("hard limit on %s - forcing transition", stage_when_armed)
+                await self._go_next(reason="time-based fallback")
+                self.session.generate_reply(
+                    instructions=(
+                        "Briefly acknowledge what they just said, then move the "
+                        "conversation on to your next question."
+                    )
+                )
+            except asyncio.CancelledError:
+                return
+
+        self._timer = asyncio.create_task(_fire())
 
 
 def prewarm(proc: JobProcess) -> None:
@@ -130,13 +248,12 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
     logger.info("connected to room %s", ctx.room.name)
 
-    # A stitched STT -> LLM -> TTS pipeline rather than one speech-to-speech
-    # socket. Gemini Live was the obvious choice for latency, but in practice its
-    # free tier stalled: it would accept a turn and never emit a generation
-    # ("generate_reply timed out waiting for generation_created"), leaving 100+
-    # seconds of dead air mid-interview. Separate components fail independently
-    # and each one here is individually fast, which is the better trade for
-    # something that has to hold up live in front of an interviewer.
+    # A stitched pipeline rather than one speech-to-speech socket. Gemini Live
+    # was the obvious choice for latency, but its free tier stalled in practice:
+    # it would accept a turn and never emit a generation ("generate_reply timed
+    # out waiting for generation_created"), leaving 100+ seconds of dead air
+    # mid-interview. Separate components fail independently, which is the better
+    # trade for something that has to hold up live.
     #
     # These are LiveKit Cloud Inference model strings, billed to the LiveKit
     # project, so no per-vendor API keys are needed.
@@ -149,17 +266,16 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     # The avatar is the presentation layer, not the interview. If Tavus is out of
-    # credits, rate-limited or down, fall back to voice-only rather than taking the
-    # whole session with it - a working audio interview beats no interview at all.
+    # credits, rate-limited or down, fall back to voice-only rather than taking
+    # the session with it - a working audio interview beats no interview.
     try:
         avatar = tavus.AvatarSession(
             face_id=TAVUS_REPLICA_ID,
             api_key=TAVUS_API_KEY,
             avatar_participant_name="Interviewer",
             # Fail fast. The default 3 retries at 2s apart spend ~14s before
-            # giving up, and that is 14s of silence the candidate sits through
-            # before the interview even opens. Errors worth retrying here are
-            # rare; a 402 or an outage is not going to clear in six seconds.
+            # giving up, and that is 14s of silence before the interview opens.
+            # A 402 or an outage will not clear in six seconds.
             conn_options=APIConnectOptions(max_retry=0, timeout=5.0),
         )
         await avatar.start(
@@ -172,7 +288,8 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.info("tavus avatar started (face %s)", TAVUS_REPLICA_ID)
     except Exception as e:
         logger.warning(
-            "tavus avatar unavailable (%s: %s) - continuing voice-only", type(e).__name__, e
+            "tavus avatar unavailable (%s: %s) - continuing voice-only",
+            type(e).__name__, e,
         )
 
     await session.start(agent=InterviewAgent(), room=ctx.room)
