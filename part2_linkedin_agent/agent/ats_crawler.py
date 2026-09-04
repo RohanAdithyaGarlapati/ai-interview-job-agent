@@ -45,6 +45,11 @@ COMMON_CAREER_PATHS = [
     "/join", "/recruitment", "/employment",
 ]
 
+# Concurrency for probing common career paths. Kept modest deliberately: the
+# free-tier instance this deploys to has a fraction of a vCPU, and the wide pool
+# that helps on a laptop just causes contention there.
+CAREER_PROBE_WORKERS = 4
+
 NAV_NOISE = ("linkedin.com", "twitter.com", "x.com", "facebook.com", "instagram.com", "youtube.com")
 
 # Path segments that look like an org slug to a naive regex but are actually a
@@ -290,7 +295,7 @@ def find_career_page(domain: str, timeout: int = 12) -> tuple[str | None, str]:
                 return None
         return None
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=CAREER_PROBE_WORKERS) as pool:
         hits = list(pool.map(_probe, COMMON_CAREER_PATHS))
 
     for path, hit in zip(COMMON_CAREER_PATHS, hits):
@@ -300,12 +305,9 @@ def find_career_page(domain: str, timeout: int = 12) -> tuple[str | None, str]:
     return None, "no careers page found"
 
 
-# Resource types this crawler never reads. It looks at request URLs, JSON bodies
-# and anchors - never a pixel - so fetching hero images, video and webfonts is
-# pure latency. Stylesheets are deliberately still allowed: some career pages
-# only render their job list once CSS has settled, and blocking them changed
-# what the DOM contained.
-_SKIP_RESOURCE_TYPES = {"image", "media", "font"}
+# Image loading is disabled at the browser level instead (see agent/browser.py):
+# a Playwright route handler would route every request through Python, which on
+# a small shared vCPU was slow enough to push requests past the gateway timeout.
 
 # Once a known ATS URL has been seen there is nothing left to wait for, so the
 # render stops early instead of sitting out a fixed delay.
@@ -332,15 +334,6 @@ def _render_and_collect(url: str, timeout_ms: int = 25000) -> dict:
         return False
 
     with browser_page(timeout_ms) as page:
-        page.route(
-            "**/*",
-            lambda route: (
-                route.abort()
-                if route.request.resource_type in _SKIP_RESOURCE_TYPES
-                else route.continue_()
-            ),
-        )
-
         def on_response(response):
             nonlocal found_ats
             try:

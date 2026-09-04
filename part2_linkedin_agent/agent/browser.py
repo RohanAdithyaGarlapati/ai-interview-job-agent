@@ -43,6 +43,14 @@ def _get_browser():
             "--mute-audio",
             "--disable-extensions",
             "--disable-background-networking",
+            # Never decode images. The crawler reads request URLs, JSON bodies
+            # and anchors, never a pixel, so hero imagery is pure latency.
+            # Done as a launch flag rather than a Playwright route handler on
+            # purpose: a route sends *every* request through a Python callback,
+            # which on a small shared vCPU cost enough to push requests past the
+            # platform's gateway timeout. This is handled inside the browser at
+            # no per-request cost.
+            "--blink-settings=imagesEnabled=false",
         ]
     )
     _local.pw, _local.browser = pw, browser
