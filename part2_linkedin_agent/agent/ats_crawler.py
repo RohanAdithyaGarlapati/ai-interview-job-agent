@@ -22,6 +22,7 @@ company):
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import requests
@@ -267,26 +268,49 @@ def find_career_page(domain: str, timeout: int = 12) -> tuple[str | None, str]:
         except Exception:
             pass
 
-    # Fallback: probe common paths directly (with retry on timeout).
-    for path in COMMON_CAREER_PATHS:
+    # Fallback: probe the common paths. Done concurrently because these are ~22
+    # independent HEAD requests against one host, and sequentially they dominated
+    # every failed lookup - a domain with no careers link in its homepage HTML
+    # spent about 28s here, mostly waiting on timeouts for paths that do not
+    # exist. The probes still resolve in list order: COMMON_CAREER_PATHS is a
+    # priority list (/careers before /team), so the earliest hit wins regardless
+    # of which request happened to return first.
+    def _probe(path: str) -> str | None:
         url = requests.compat.urljoin(home, path)
-        for attempt in range(2):  # Retry once on transient failure
+        for attempt in range(2):  # one retry, for transient timeouts only
             try:
                 r = requests.head(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-                if r.status_code == 405:  # some servers reject HEAD
+                if r.status_code == 405:  # some servers reject HEAD outright
                     r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-                if r.status_code < 400:
-                    return r.url, f"guessed common path {path}"
-                break  # Don't retry on non-timeout failures
+                return r.url if r.status_code < 400 else None
             except requests.Timeout:
-                if attempt == 1:  # Last attempt
-                    break
-                # Retry once on timeout
-                continue
+                if attempt == 1:
+                    return None
             except requests.RequestException:
-                break
+                return None
+        return None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        hits = list(pool.map(_probe, COMMON_CAREER_PATHS))
+
+    for path, hit in zip(COMMON_CAREER_PATHS, hits):
+        if hit:
+            return hit, f"guessed common path {path}"
 
     return None, "no careers page found"
+
+
+# Resource types this crawler never reads. It looks at request URLs, JSON bodies
+# and anchors - never a pixel - so fetching hero images, video and webfonts is
+# pure latency. Stylesheets are deliberately still allowed: some career pages
+# only render their job list once CSS has settled, and blocking them changed
+# what the DOM contained.
+_SKIP_RESOURCE_TYPES = {"image", "media", "font"}
+
+# Once a known ATS URL has been seen there is nothing left to wait for, so the
+# render stops early instead of sitting out a fixed delay.
+_EARLY_EXIT_POLL_MS = 100
+_MAX_SETTLE_MS = 1500
 
 
 def _render_and_collect(url: str, timeout_ms: int = 25000) -> dict:
@@ -294,28 +318,60 @@ def _render_and_collect(url: str, timeout_ms: int = 25000) -> dict:
     bodies: list[str] = []
     anchors: list[str] = []
     html = ""
+    found_ats = False
+
+    def _is_ats(candidate: str) -> bool:
+        for rule in ATS_RULES:
+            m = rule.pattern.search(candidate)
+            if not m:
+                continue
+            gd = m.groupdict()
+            slug = (gd.get("slug") or gd.get("sub") or "").lower()
+            if slug not in ATS_SLUG_BLOCKLIST:
+                return True
+        return False
 
     with browser_page(timeout_ms) as page:
+        page.route(
+            "**/*",
+            lambda route: (
+                route.abort()
+                if route.request.resource_type in _SKIP_RESOURCE_TYPES
+                else route.continue_()
+            ),
+        )
 
         def on_response(response):
+            nonlocal found_ats
             try:
                 urls_seen.add(response.url)
+                if _is_ats(response.url):
+                    found_ats = True
                 ctype = response.headers.get("content-type", "")
                 if ("json" in ctype) and int(response.headers.get("content-length", "0") or 0) < 400_000:
-                    bodies.append(response.text())
+                    body = response.text()
+                    bodies.append(body)
+                    if _is_ats(body):
+                        found_ats = True
             except Exception:
                 pass
 
         page.on("response", on_response)
         try:
-            page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+            # domcontentloaded, not networkidle. networkidle waits for 500ms of
+            # total network silence, which analytics beacons and polling widgets
+            # can hold off for many seconds on a page that was usable almost
+            # immediately. The settle loop below covers the late XHR that
+            # actually matters here.
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         except Exception:
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            except Exception:
-                pass
+            pass
+
         try:
-            page.wait_for_timeout(1200)
+            waited = 0
+            while waited < _MAX_SETTLE_MS and not found_ats:
+                page.wait_for_timeout(_EARLY_EXIT_POLL_MS)
+                waited += _EARLY_EXIT_POLL_MS
             html = page.content()
             anchors = page.eval_on_selector_all("a", "els => els.map(e => e.href)")
         except Exception:
