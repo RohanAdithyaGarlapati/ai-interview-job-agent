@@ -103,10 +103,15 @@ def resolve_job_source(linkedin_url: str) -> JobSourceResult:
         return result
 
     try:
+        # Rendered once, not twice. This used to retry whenever no ATS was found,
+        # on the grounds that a cold browser launch could miss late JS/XHR - but
+        # agent/browser.py now keeps one warm browser for the process, so there
+        # is no cold start to lose a request to. Meanwhile the retry fired on
+        # exactly the case it could never help: a company that genuinely runs its
+        # own job board has no ATS link to find, so the second render was
+        # guaranteed to come back empty, having doubled the slowest step in the
+        # pipeline for every such company.
         listing_url, ats_name, evidence = find_ats_listing(career_page)
-        if not listing_url:
-            # Cold browser launch can occasionally miss late JS/XHR calls; retry once.
-            listing_url, ats_name, evidence = find_ats_listing(career_page)
     except Exception as e:
         # Browser rendering failed -- still report the career page as a partial success.
         result.final_url = career_page
